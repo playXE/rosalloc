@@ -594,7 +594,8 @@ pub struct Rosalloc {
 
     free_page_run_size_map: Vec<usize>,
 
-    morecore: Option<extern "C" fn(rosalloc: *mut Rosalloc, increment: isize)>,
+    morecore: Option<extern "C" fn(rosalloc: *mut Rosalloc, increment: isize, data: *mut u8)>,
+    morecore_data: *mut u8,
 }
 impl Drop for Rosalloc {
     fn drop(&mut self) {
@@ -690,7 +691,7 @@ impl Rosalloc {
                 self.page_map_size = new_num_of_pages;
                 self.free_page_run_size_map.resize(new_num_of_pages, 0);
                 if let Some(morecore) = self.morecore {
-                    morecore(self, -(decrement as isize));
+                    morecore(self, -(decrement as isize), self.morecore_data);
                 }
                 self.footprint = new_footprint;
                 return true;
@@ -699,8 +700,13 @@ impl Rosalloc {
         false
     }
 
-    pub fn set_morecore(&mut self, morecore: extern "C" fn(*mut Self, isize)) {
+    pub fn set_morecore(
+        &mut self,
+        morecore: extern "C" fn(*mut Self, isize, *mut u8),
+        data: *mut u8,
+    ) {
         self.morecore = Some(morecore);
+        self.morecore_data = data;
     }
     pub fn new(
         base: *mut u8,
@@ -729,6 +735,7 @@ impl Rosalloc {
             page_map_size: 0,
             max_page_map_size: 0,
             morecore: None,
+            morecore_data: null_mut(),
         };
 
         if INITIALIZED
@@ -921,7 +928,7 @@ impl Rosalloc {
                 self.page_map_size = new_num_of_pages;
                 self.free_page_run_size_map.resize(new_num_of_pages, 0);
                 if let Some(morecore) = self.morecore {
-                    morecore(self, increment as _);
+                    morecore(self, increment as _, self.morecore_data);
                 } else {
                     return null_mut();
                 }
