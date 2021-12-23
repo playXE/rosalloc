@@ -1302,6 +1302,7 @@ impl Rosalloc {
 
                     if thread_local_run.is_null() {
                         tls_run[idx] = DEDICATED_FULL_RUN;
+                        (*self.size_bracket_locks[idx]).unlock();
                         return null_mut();
                     }
 
@@ -1322,6 +1323,7 @@ impl Rosalloc {
             *usable_size = bracket_size;
         } else {
             (*self.size_bracket_locks[idx]).lock();
+
             slot_addr = self.alloc_from_current_run_unlocked(idx);
             (*self.size_bracket_locks[idx]).unlock();
             if !slot_addr.is_null() {
