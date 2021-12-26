@@ -13,7 +13,7 @@ use mmap::Mmap;
 use parking_lot::{lock_api::RawMutex, lock_api::RawRwLock, RawMutex as Lock, RawRwLock as RwLock};
 use std::{
     collections::HashSet,
-    hash::{BuildHasher, Hasher},
+    hash::{BuildHasherDefault, Hasher},
     mem::size_of,
     ptr::null_mut,
     sync::atomic::AtomicBool,
@@ -48,16 +48,16 @@ impl FreePageRun {
     pub fn begin(&self) -> *mut u8 {
         self as *const Self as *mut u8
     }
-
-    pub fn byte_size(&self, rosalloc: &Rosalloc) -> usize {
+    #[inline]
+    pub unsafe fn byte_size(&self, rosalloc: &Rosalloc) -> usize {
         let fpr_base = self as *const Self as *mut u8;
 
         let pm_idx = rosalloc.to_page_map_index(fpr_base);
 
-        rosalloc.free_page_run_size_map[pm_idx]
+        *rosalloc.free_page_run_size_map.get_unchecked(pm_idx)
     }
 
-    pub fn set_byte_size(&self, rosalloc: &mut Rosalloc, byte_size: usize) {
+    pub unsafe fn set_byte_size(&self, rosalloc: &mut Rosalloc, byte_size: usize) {
         let fpr_base = self as *const Self as *mut u8;
 
         let pm_idx = rosalloc.to_page_map_index(fpr_base);
@@ -70,16 +70,16 @@ impl FreePageRun {
         unsafe { fpr_base.add(self.byte_size(rosalloc)) }
     }
 
-    pub fn is_larger_than_page_release_threshold(&self, rosalloc: &Rosalloc) -> bool {
+    pub unsafe fn is_larger_than_page_release_threshold(&self, rosalloc: &Rosalloc) -> bool {
         self.byte_size(rosalloc) >= rosalloc.page_release_size_threshold
     }
 
-    pub fn is_at_end_of_space(&self, rosalloc: &Rosalloc) -> bool {
+    pub unsafe fn is_at_end_of_space(&self, rosalloc: &Rosalloc) -> bool {
         self as *const Self as usize + self.byte_size(rosalloc)
             == rosalloc.base as usize + rosalloc.footprint
     }
 
-    pub fn should_release_pages(&self, rosalloc: &Rosalloc) -> bool {
+    pub unsafe fn should_release_pages(&self, rosalloc: &Rosalloc) -> bool {
         match rosalloc.page_release_mode {
             PageReleaseMode::None => false,
             PageReleaseMode::End => self.is_at_end_of_space(rosalloc),
@@ -92,13 +92,11 @@ impl FreePageRun {
         }
     }
 
-    pub fn release_pages(&self, rosalloc: &mut Rosalloc) {
+    pub unsafe fn release_pages(&self, rosalloc: &mut Rosalloc) {
         let start = self as *const Self as *mut u8;
         let byte_size = self.byte_size(rosalloc);
         if self.should_release_pages(rosalloc) {
-            unsafe {
-                rosalloc.release_page_range(start, (start as usize + byte_size) as _);
-            }
+            rosalloc.release_page_range(start, (start as usize + byte_size) as _);
         }
     }
 }
@@ -383,19 +381,22 @@ impl Run {
     pub fn alloc_slot(&mut self) -> *mut Slot {
         self.free_list.remove()
     }
+    #[inline]
     pub fn is_full(&self) -> bool {
         self.free_list.size() == 0
     }
+    #[inline]
     pub fn is_all_free(&self) -> bool {
         self.free_list.size() == NUM_OF_SLOTS[self.size_bracket_idx as usize]
     }
-    pub fn free_slot(&mut self, ptr: *mut u8) {
+    #[inline]
+    pub unsafe fn free_slot(&mut self, ptr: *mut u8) {
         let idx = self.size_bracket_idx as usize;
-        let bracket_size = BRACKET_SIZES[idx];
+        let bracket_size = *BRACKET_SIZES.get_unchecked(idx);
         let slot = self.to_slot(ptr);
-        unsafe {
-            memx::memset(std::slice::from_raw_parts_mut(slot.cast(), bracket_size), 0);
-        }
+
+        memx::memset(std::slice::from_raw_parts_mut(slot.cast(), bracket_size), 0);
+
         self.free_list.add(slot);
     }
     #[inline]
@@ -431,30 +432,29 @@ impl Run {
     }
 
     #[inline]
-    pub fn add_to_free_list_shared(
+    pub unsafe fn add_to_free_list_shared(
         &mut self,
         ptr: *mut u8,
         free_list: *mut SlotFreeList<true>,
     ) -> usize {
         let idx = self.size_bracket_idx as usize;
-        let bracket_size = BRACKET_SIZES[idx];
+        let bracket_size = *BRACKET_SIZES.get_unchecked(idx);
 
         let slot = self.to_slot(ptr);
-        unsafe {
-            memx::memset(std::slice::from_raw_parts_mut(slot.cast(), bracket_size), 0);
-            (*free_list).add(slot);
-        }
+        memx::memset(std::slice::from_raw_parts_mut(slot.cast(), bracket_size), 0);
+        (*free_list).add(slot);
+
         bracket_size
     }
 
     #[inline]
-    pub fn add_to_bulk_free_list(&mut self, ptr: *mut u8) -> usize {
+    pub unsafe fn add_to_bulk_free_list(&mut self, ptr: *mut u8) -> usize {
         let list = &mut self.bulk_free_list as *mut _;
         self.add_to_free_list_shared(ptr, list)
     }
 
     #[inline]
-    pub fn add_to_thread_local_free_list(&mut self, ptr: *mut u8) {
+    pub unsafe fn add_to_thread_local_free_list(&mut self, ptr: *mut u8) {
         let list = &mut self.thread_local_free_list as *mut _;
         self.add_to_free_list_shared(ptr, list);
     }
@@ -488,83 +488,80 @@ impl Run {
     }
 
     #[inline]
-    pub fn zero_data(&mut self) {
+    pub unsafe fn zero_data(&mut self) {
         let idx = self.size_bracket_idx as usize;
         let slot_begin = self.first_slot();
-        unsafe {
-            memx::memset(
-                std::slice::from_raw_parts_mut(
-                    slot_begin.cast(),
-                    NUM_OF_SLOTS[idx] * BRACKET_SIZES[idx],
-                ),
-                0,
-            );
-        }
+
+        memx::memset(
+            std::slice::from_raw_parts_mut(
+                slot_begin.cast(),
+                *NUM_OF_SLOTS.get_unchecked(idx) * *BRACKET_SIZES.get_unchecked(idx),
+            ),
+            0,
+        );
     }
 
     pub const fn fixed_header_size() -> usize {
         size_of::<Self>()
     }
-
-    pub fn first_slot(&self) -> *mut Slot {
+    #[inline]
+    pub unsafe fn first_slot(&self) -> *mut Slot {
         let idx = self.size_bracket_idx as usize;
-        (self as *const Self as usize + HEADER_SIZES[idx]) as _
+        (self as *const Self as usize + *HEADER_SIZES.get_unchecked(idx)) as _
     }
-
-    pub fn last_slot(&self) -> *mut Slot {
+    #[inline]
+    pub unsafe fn last_slot(&self) -> *mut Slot {
         let idx = self.size_bracket_idx as usize;
-        let bracket_size = BRACKET_SIZES[idx];
+        let bracket_size = *BRACKET_SIZES.get_unchecked(idx);
         let end = self.end();
-        let last_slot = unsafe { end.sub(bracket_size).cast::<Slot>() };
+        let last_slot = end.sub(bracket_size).cast::<Slot>();
         debug_assert!(self.first_slot() <= last_slot);
         last_slot
     }
 
-    pub fn init_free_list(&mut self) {
+    pub unsafe fn init_free_list(&mut self) {
         let idx = self.size_bracket_idx as usize;
         let bracket_size = BRACKET_SIZES[idx];
         let first_slot = self.first_slot();
         let mut slot = self.last_slot();
         while slot >= first_slot {
-            unsafe {
-                self.free_list.add(slot);
-                slot = (*slot).left(bracket_size);
-            }
+            self.free_list.add(slot);
+            slot = (*slot).left(bracket_size);
         }
     }
-
+    #[inline]
     pub fn number_of_free_slots(&self) -> usize {
         self.free_list.size()
     }
-
+    #[inline]
     pub fn is_bulk_free_list_empty(&self) -> bool {
         self.bulk_free_list.size() == 0
     }
-
+    #[inline]
     pub fn is_thread_local_free_list_empty(&self) -> bool {
         self.thread_local_free_list.size() == 0
     }
-
-    pub fn to_slot(&self, ptr: *const u8) -> *mut Slot {
+    #[inline]
+    pub unsafe fn to_slot(&self, ptr: *const u8) -> *mut Slot {
         let idx = self.size_bracket_idx as usize;
-        let bracket_size = BRACKET_SIZES[idx];
+        let bracket_size = *BRACKET_SIZES.get_unchecked(idx);
         let offset_from_slot_base = ptr as usize - self.first_slot() as usize;
         debug_assert_eq!(offset_from_slot_base % bracket_size, 0);
         let slot_idx = offset_from_slot_base / bracket_size;
         debug_assert!(slot_idx < NUM_OF_SLOTS[idx]);
         ptr as _
     }
-
-    pub fn slot_index(&self, ptr: *const u8) -> usize {
+    #[inline]
+    pub unsafe fn slot_index(&self, ptr: *const u8) -> usize {
         let idx = self.size_bracket_idx as usize;
-        let bracket_size = BRACKET_SIZES[idx];
+        let bracket_size = *BRACKET_SIZES.get_unchecked(idx);
         let offset_from_slot_base = ptr as usize - self.first_slot() as usize;
         debug_assert_eq!(offset_from_slot_base % bracket_size, 0);
         let slot_idx = offset_from_slot_base / bracket_size;
         debug_assert!(slot_idx < NUM_OF_SLOTS[idx]);
         slot_idx
     }
-
+    #[inline]
     pub fn end(&self) -> *mut u8 {
         (self as *const Self as usize + PAGE_SIZE * NUM_OF_PAGES[self.size_bracket_idx as usize])
             as _
@@ -577,11 +574,11 @@ pub struct Rosalloc {
     capacity: usize,
     max_capacity: usize,
 
-    full_runs: [*mut HashSet<*mut Run, PtrHasher>; NUM_OF_SIZE_BRACKETS],
+    full_runs: [*mut HashSet<*mut Run, BuildNoopHasher>; NUM_OF_SIZE_BRACKETS],
     current_runs: [*mut Run; NUM_OF_SIZE_BRACKETS],
     size_bracket_locks: [*mut Lock; NUM_OF_SIZE_BRACKETS],
-    non_full_runs: [*mut IndexSet<*mut Run, PtrHasher>; NUM_OF_SIZE_BRACKETS],
-    free_page_runs: Box<IndexSet<*mut FreePageRun, PtrHasher>>,
+    non_full_runs: [*mut IndexSet<*mut Run, BuildNoopHasher>; NUM_OF_SIZE_BRACKETS],
+    free_page_runs: Box<IndexSet<*mut FreePageRun, BuildNoopHasher>>,
     page_map: *mut u8,
     page_map_size: usize,
     max_page_map_size: usize,
@@ -690,13 +687,16 @@ impl Rosalloc {
                 let new_num_of_pages = new_footprint / PAGE_SIZE;
                 self.page_map_size = new_num_of_pages;
                 self.free_page_run_size_map.resize(new_num_of_pages, 0);
+
                 if let Some(morecore) = self.morecore {
                     morecore(self, -(decrement as isize), self.morecore_data);
                 }
                 self.footprint = new_footprint;
+                self.lock.unlock();
                 return true;
             }
         }
+        self.lock.unlock();
         false
     }
 
@@ -726,7 +726,7 @@ impl Rosalloc {
             page_release_mode,
             page_release_size_threshold,
             free_page_run_size_map: Vec::new(),
-            free_page_runs: Box::new(IndexSet::with_hasher(PtrHasher(0))),
+            free_page_runs: Box::new(IndexSet::with_hasher(BuildNoopHasher::default())),
             full_runs: [null_mut(); NUM_OF_SIZE_BRACKETS],
             current_runs: [null_mut(); NUM_OF_SIZE_BRACKETS],
             non_full_runs: [null_mut(); NUM_OF_SIZE_BRACKETS],
@@ -777,8 +777,9 @@ impl Rosalloc {
             this.free_page_runs.insert(free_pages);
             for i in 0..NUM_OF_SIZE_BRACKETS {
                 this.non_full_runs[i] =
-                    Box::into_raw(Box::new(IndexSet::with_hasher(PtrHasher(0))));
-                this.full_runs[i] = Box::into_raw(Box::new(HashSet::with_hasher(PtrHasher(0))));
+                    Box::into_raw(Box::new(IndexSet::with_hasher(Default::default())));
+                this.full_runs[i] =
+                    Box::into_raw(Box::new(HashSet::with_hasher(Default::default())));
             }
         }
 
@@ -795,7 +796,7 @@ impl Rosalloc {
         }
 
         self.bulk_free_lock.lock_exclusive();
-        let mut runs = HashSet::with_hasher(PtrHasher(0));
+        let mut runs = IndexSet::with_hasher(BuildNoopHasher::default());
         for ptr in pointers.iter().copied() {
             let pm_idx = self.round_down_to_page_map_index(ptr);
             let run;
@@ -826,7 +827,7 @@ impl Rosalloc {
 
         for run in runs {
             let idx = (*run).size_bracket_idx as usize;
-            (*self.size_bracket_locks[idx]).lock();
+            (**self.size_bracket_locks.get_unchecked(idx)).lock();
             if (*run).is_thread_local != 0 {
                 (*run).merge_bulk_free_list_to_thread_local_free_list();
             } else {
@@ -840,7 +841,7 @@ impl Rosalloc {
                     null_mut()
                 };
                 if (*run).is_all_free() {
-                    let run_was_current = run == self.current_runs[idx];
+                    let run_was_current = run == *self.current_runs.get_unchecked(idx);
                     if run_was_full {
                         if cfg!(debug_assertions) {
                             debug_assert!((*full_runs).remove(&run));
@@ -856,7 +857,7 @@ impl Rosalloc {
                         self.lock.unlock();
                     }
                 } else {
-                    if run == self.current_runs[idx] {
+                    if run == *self.current_runs.get_unchecked(idx) {
                         debug_assert!(!non_full_runs.contains(&run));
                     } else if run_was_full {
                         if cfg!(debug_assertions) {
@@ -869,7 +870,7 @@ impl Rosalloc {
                     }
                 }
             }
-            (*self.size_bracket_locks[idx]).unlock();
+            (**self.size_bracket_locks.get_unchecked(idx)).unlock();
         }
 
         self.bulk_free_lock.unlock_exclusive();
@@ -1285,7 +1286,7 @@ impl Rosalloc {
             let mut thread_local_run = tls_run[idx];
             slot_addr = (*thread_local_run).alloc_slot().cast::<u8>();
             if slot_addr.is_null() {
-                (*self.size_bracket_locks[idx]).lock();
+                (**self.size_bracket_locks.get_unchecked(idx)).lock();
                 let mut is_all_free_after_merge = false;
 
                 if (*thread_local_run)
@@ -1302,7 +1303,7 @@ impl Rosalloc {
 
                     if thread_local_run.is_null() {
                         tls_run[idx] = DEDICATED_FULL_RUN;
-                        (*self.size_bracket_locks[idx]).unlock();
+                        (**self.size_bracket_locks.get_unchecked(idx)).unlock();
                         return null_mut();
                     }
 
@@ -1315,17 +1316,16 @@ impl Rosalloc {
                 slot_addr = (*thread_local_run).alloc_slot().cast();
 
                 debug_assert!(!slot_addr.is_null());
-                (*self.size_bracket_locks[idx]).unlock();
+                (**self.size_bracket_locks.get_unchecked(idx)).unlock();
             } else {
                 *bytes_tl_bulk_allocated = 0;
             }
             *bytes_allocated = bracket_size;
             *usable_size = bracket_size;
         } else {
-            (*self.size_bracket_locks[idx]).lock();
-
+            (**self.size_bracket_locks.get_unchecked(idx)).lock();
             slot_addr = self.alloc_from_current_run_unlocked(idx);
-            (*self.size_bracket_locks[idx]).unlock();
+            (**self.size_bracket_locks.get_unchecked(idx)).unlock();
             if !slot_addr.is_null() {
                 *bytes_allocated = bracket_size;
                 *usable_size = bracket_size;
@@ -1334,6 +1334,36 @@ impl Rosalloc {
         }
         slot_addr
     }
+    /// Allocates `size` bytes in rosalloc space using global runs. This operation is expensive in case multiple
+    /// threads are allocating into the same run. Returns null if no memory to satisfy allocation `size` of bytes is left.
+    #[inline]
+    pub unsafe fn alloc_global(
+        &mut self,
+        size: usize,
+        bytes_allocated: &mut usize,
+        usable_size: &mut usize,
+        bytes_tl_bulk_allocated: &mut usize,
+    ) -> *mut u8 {
+        if size > Self::LARGE_SIZE_THRESHOLD {
+            return self.alloc_large_object(
+                size,
+                bytes_allocated,
+                usable_size,
+                bytes_tl_bulk_allocated,
+            );
+        }
+        let (idx, bracket_size) = Self::size_to_index_and_bracket_size(size);
+        (**self.size_bracket_locks.get_unchecked(idx)).lock();
+        let slot_addr = self.alloc_from_current_run_unlocked(idx);
+        (**self.size_bracket_locks.get_unchecked(idx)).unlock();
+        if !slot_addr.is_null() {
+            *bytes_allocated = bracket_size;
+            *usable_size = bracket_size;
+            *bytes_tl_bulk_allocated = bracket_size;
+        }
+        slot_addr
+    }
+
     /// Attempts to allocate a block of memory. If there is no enough memory `null` is returned and `bytes_allocated `with `usable_size` are set to zero.
     ///
     /// # Safety
@@ -1379,7 +1409,7 @@ impl Rosalloc {
 
     unsafe fn free_from_run(&mut self, ptr: *mut u8, run: *mut Run) -> usize {
         let idx = (*run).size_bracket_idx as usize;
-        let bracket_size = BRACKET_SIZES[idx as usize];
+        let bracket_size = *BRACKET_SIZES.get_unchecked(idx as usize);
 
         (*self.size_bracket_locks[idx]).lock();
 
@@ -1696,34 +1726,25 @@ pub const HEADER_SIZES: [usize; NUM_OF_SIZE_BRACKETS] = {
     header_sizes
 };
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct PtrHasher(u64);
 
 impl Hasher for PtrHasher {
     fn write(&mut self, bytes: &[u8]) {
-        debug_assert_eq!(bytes.len(), size_of::<usize>());
-        #[cfg(target_pointer_width = "64")]
-        {
-            self.0 = usize::from_ne_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-            ]) as _;
+        for &byte in bytes {
+            self.0 = (self.0 << 8) ^ (byte as u64);
         }
-        #[cfg(target_pointer_width = "32")]
-        {
-            self.0 = usize::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as _;
-        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 ^= value;
     }
     fn finish(&self) -> u64 {
         self.0
     }
 }
 
-impl BuildHasher for PtrHasher {
-    type Hasher = Self;
-    fn build_hasher(&self) -> Self::Hasher {
-        PtrHasher(0)
-    }
-}
+type BuildNoopHasher = BuildHasherDefault<PtrHasher>;
 
 /// Returns dedicated full run so rosalloc knows when to create new run for allocation.
 #[inline]
