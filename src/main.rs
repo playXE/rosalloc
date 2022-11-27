@@ -7,7 +7,7 @@ use std::{
 
 use rosalloc::{
     allocator::RosallocAllocator,
-    defs::{GB, NUM_THREAD_LOCAL_SIZE_BRACKETS},
+    defs::{NUM_THREAD_LOCAL_SIZE_BRACKETS, MB},
     BRACKET_SIZES, NUM_OF_PAGES, NUM_OF_SLOTS,
 };
 
@@ -66,14 +66,23 @@ fn main() {
         &NUM_OF_PAGES[0..NUM_THREAD_LOCAL_SIZE_BRACKETS],
         &NUM_OF_SLOTS[0..NUM_THREAD_LOCAL_SIZE_BRACKETS]
     );
-    let rosalloc = RosallocAllocator::new(2 * GB);
-    let x = UniquePtr::new(rosalloc, 48);
+    let rosalloc = RosallocAllocator::new(2 * MB);
+    
+    { 
+        let x = UniquePtr::new(rosalloc, 48);
 
-    println!("{:p}", x);
-    drop(x);
-    unsafe {
-        rosalloc.force_merge_freelists_tls();
+        println!("{:p}", x);
+        drop(x);
+        unsafe {
+            rosalloc.force_merge_freelists_tls();
+        }
+        let x = UniquePtr::new(rosalloc, [0; 96]);
+        let very_large = UniquePtr::new(rosalloc, [0u8; 2049]);
+        println!("{:p} {:p}", x, very_large);
+
+        unsafe { 
+            println!("{:p} {:p}", &x[73], rosalloc.block_start(&x[73]));
+        }
     }
-    let x = UniquePtr::new(rosalloc, 48);
-    println!("{:p}", x);
+    RosallocAllocator::dispose(rosalloc);
 }

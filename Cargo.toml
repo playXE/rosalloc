@@ -6,13 +6,14 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-parking_lot = "0.11"
+parking_lot = { version = "0.12", feature = ["deadlock_detection"] }
 memx = "0.1"
 libc = "0.2"
 indexmap = "1.7"
 thread_local = { version = "1.1", optional = true }
-
-
+log = { version = "0.4", optional = true}
+cfg-if = "1.0"
 [features]
 allocator-api = ["thread_local"]
-default = ["allocator-api"]
+default = ["trace", "allocator-api"]
+trace = ["log"]

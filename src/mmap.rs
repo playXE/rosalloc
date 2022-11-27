@@ -189,12 +189,14 @@ pub mod _miri {
         }
 
         pub fn new(size: usize) -> Self {
-            let mut mem = vec![0usize; size / size_of::<usize>() + 32];
-
-            let start = &mut mem[0] as *mut usize as *mut u8;
+            let mem = unsafe { libc::malloc(size) as *mut u8 }; //vec![0usize; size / size_of::<usize>() + 32];
+            unsafe {
+                core::ptr::write_bytes(mem, 0, size);
+            }
+            let start = mem;
             let end = unsafe { start.add(size) };
             Self {
-                vec: mem,
+                vec: Vec::new(),
                 start,
                 end,
                 size,
@@ -222,6 +224,11 @@ pub mod _miri {
             self.size
         }
     }
+    impl Drop for Mmap {
+        fn drop(&mut self) {
+            unsafe { libc::free(self.start as _); }
+        }
+    }
 }
 
 #[cfg(all(not(miri), unix))]
@@ -231,19 +238,8 @@ pub use _win::*;
 
 impl Mmap {
     pub fn dontneed_and_zero(&self, page: *mut u8, size: usize) {
-        #[cfg(not(miri))]
-        {
-            if !cfg!(linux) {
-                unsafe {
-                    memx::memset(std::slice::from_raw_parts_mut(page, size), 0);
-                }
-            }
-        }
-        #[cfg(miri)]
-        {
-            unsafe {
-                std::ptr::write_bytes(page, 0, size);
-            }
+        unsafe {
+            std::ptr::write_bytes(page, 0, size);
         }
         self.dontneed(page, size);
     }

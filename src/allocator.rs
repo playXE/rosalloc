@@ -104,6 +104,16 @@ impl RosallocAllocator {
             (*run).merge_thread_local_free_list_to_free_list(&mut false);
         });
     }
+
+    pub unsafe fn usable_size(&self, ptr: *mut u8) -> usize {
+        let inner = &mut *self.inner;
+        (*inner.rosalloc).usable_size(ptr)
+    }
+
+    pub unsafe fn block_start(&self, ptr: *const u8) -> *mut u8 {
+        let inner = &mut *self.inner;
+        (*inner.rosalloc).block_start(ptr as _)
+    }
 }
 unsafe impl Allocator for RosallocAllocator {
     fn allocate(
@@ -118,3 +128,4 @@ unsafe impl Allocator for RosallocAllocator {
         self.free_impl(ptr.as_ptr().cast());
     }
 }
+

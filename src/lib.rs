@@ -19,6 +19,9 @@ use std::{
     sync::atomic::AtomicBool,
 };
 
+
+pub const TRACE_ROSALLOC: bool = true;
+
 #[repr(C)]
 pub struct FreePageRun {
     pub magic_num: u8,
@@ -30,9 +33,17 @@ static mut DEDICATED_FULL_RUN: *mut Run = null_mut();
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 unsafe fn initialize() {
+    
     INITIALIZED.store(true, std::sync::atomic::Ordering::Release);
-
-    DEDICATED_FULL_RUN = DEDICATED_FULL_RUN_STORAGE.as_mut_ptr().cast();
+    #[cfg(not(miri))]
+    {
+        DEDICATED_FULL_RUN = DEDICATED_FULL_RUN_STORAGE.as_mut_ptr().cast();
+    }
+    #[cfg(miri)]
+    {
+        DEDICATED_FULL_RUN = libc::malloc(size_of::<usize>() * (PAGE_SIZE / size_of::<usize>())) as *mut Run;
+        core::ptr::write_bytes(DEDICATED_FULL_RUN as *mut u8, 0, size_of::<usize>() * (PAGE_SIZE / size_of::<usize>()));
+    }
     if cfg!(debug_assertions) {
         (*DEDICATED_FULL_RUN).magic_num = MAGIC_NUM;
     }
@@ -177,9 +188,9 @@ impl<const USE_TAIL: bool> SlotFreeList<USE_TAIL> {
             self.verify();
         }
         unsafe {
-            let headp = &self.head as *const u64 as *mut *mut Slot;
+            let headp = &mut self.head as *mut u64 as *mut *mut Slot;
             let tailp = if USE_TAIL {
-                &self.tail as *const u64 as *mut *mut Slot
+                &mut self.tail as *mut u64 as *mut *mut Slot
             } else {
                 null_mut()
             };
@@ -216,9 +227,9 @@ impl<const USE_TAIL: bool> SlotFreeList<USE_TAIL> {
         debug_assert!(!slot.is_null());
         unsafe {
             debug_assert!((*slot).next().is_null());
-            let headp = &self.head as *const u64 as *mut *mut Slot;
+            let headp = &mut self.head as *mut u64 as *mut *mut Slot;
             let tailp = if USE_TAIL {
-                &self.tail as *const u64 as *mut *mut Slot
+                &mut self.tail as *mut u64 as *mut *mut Slot
             } else {
                 null_mut()
             };
@@ -259,9 +270,9 @@ impl<const USE_TAIL: bool> SlotFreeList<USE_TAIL> {
         if list.size() == 0 {
             return;
         }
-        let headp = &self.head as *const u64 as *mut *mut Slot;
+        let headp = &mut self.head as *mut u64 as *mut *mut Slot;
         let tailp = if USE_TAIL {
-            &self.tail as *const u64 as *mut *mut Slot
+            &mut self.tail as *mut u64 as *mut *mut Slot
         } else {
             null_mut()
         };
@@ -379,7 +390,17 @@ pub struct Run {
 impl Run {
     #[inline]
     pub fn alloc_slot(&mut self) -> *mut Slot {
-        self.free_list.remove()
+        let slot = self.free_list.remove();
+        #[cfg(feature="trace")]
+        if !slot.is_null() {
+            log::info!(
+                "RosAlloc::Run::alloc_slot() : {:p}, bracket_size={}, slot_idx={}",
+                slot,
+                BRACKET_SIZES[self.size_bracket_idx as usize],
+                unsafe { self.slot_index(slot as _) }
+            );
+        }
+        slot 
     }
     #[inline]
     pub fn is_full(&self) -> bool {
@@ -395,7 +416,8 @@ impl Run {
         let bracket_size = *BRACKET_SIZES.get_unchecked(idx);
         let slot = self.to_slot(ptr);
 
-        memx::memset(std::slice::from_raw_parts_mut(slot.cast(), bracket_size), 0);
+        core::ptr::write_bytes(slot.cast::<u8>(), 0, bracket_size);
+        //memx::memset(std::slice::from_raw_parts_mut(slot.cast(), bracket_size), 0);
 
         self.free_list.add(slot);
     }
@@ -435,13 +457,13 @@ impl Run {
     pub unsafe fn add_to_free_list_shared(
         &mut self,
         ptr: *mut u8,
-        free_list: *mut SlotFreeList<true>,
+        free_list: &mut SlotFreeList<true>,
     ) -> usize {
         let idx = self.size_bracket_idx as usize;
         let bracket_size = *BRACKET_SIZES.get_unchecked(idx);
 
         let slot = self.to_slot(ptr);
-        memx::memset(std::slice::from_raw_parts_mut(slot.cast(), bracket_size), 0);
+        core::ptr::write_bytes(slot.cast::<u8>(), 0, bracket_size);
         (*free_list).add(slot);
 
         bracket_size
@@ -449,14 +471,33 @@ impl Run {
 
     #[inline]
     pub unsafe fn add_to_bulk_free_list(&mut self, ptr: *mut u8) -> usize {
-        let list = &mut self.bulk_free_list as *mut _;
-        self.add_to_free_list_shared(ptr, list)
+        
+        //self.add_to_free_list_shared(ptr, list)
+
+        let idx = self.size_bracket_idx as usize;
+        let bracket_size = *BRACKET_SIZES.get_unchecked(idx);
+
+        let slot = self.to_slot(ptr);
+        let list = &mut self.bulk_free_list;
+        core::ptr::write_bytes(slot.cast::<u8>(), 0, bracket_size);
+        list.add(slot);
+
+        bracket_size
     }
 
     #[inline]
     pub unsafe fn add_to_thread_local_free_list(&mut self, ptr: *mut u8) {
-        let list = &mut self.thread_local_free_list as *mut _;
-        self.add_to_free_list_shared(ptr, list);
+        /*let list = &mut self.thread_local_free_list;
+        self.add_to_free_list_shared(ptr, list);*/
+
+        let idx = self.size_bracket_idx as usize;
+        let bracket_size = *BRACKET_SIZES.get_unchecked(idx);
+
+        let slot = self.to_slot(ptr);
+        let list = &mut self.thread_local_free_list;
+        core::ptr::write_bytes(slot.cast::<u8>(), 0, bracket_size);
+        list.add(slot);
+
     }
 
     #[inline]
@@ -472,10 +513,12 @@ impl Run {
         }
 
         unsafe {
-            memx::memset(
+            /*memx::memset(
                 std::slice::from_raw_parts_mut(self as *mut Self as *mut u8, HEADER_SIZES[idx]),
                 0,
-            );
+            );*/
+
+            core::ptr::write_bytes(self as *const Self as *mut u8, 0, HEADER_SIZES[idx]);
 
             if cfg!(debug_assertions) {
                 let size = NUM_OF_PAGES[idx] * PAGE_SIZE;
@@ -492,13 +535,14 @@ impl Run {
         let idx = self.size_bracket_idx as usize;
         let slot_begin = self.first_slot();
 
-        memx::memset(
+        /*memx::memset(
             std::slice::from_raw_parts_mut(
                 slot_begin.cast(),
                 *NUM_OF_SLOTS.get_unchecked(idx) * *BRACKET_SIZES.get_unchecked(idx),
             ),
             0,
-        );
+        );*/
+        core::ptr::write_bytes(slot_begin.cast::<u8>(), 0, *NUM_OF_SLOTS.get_unchecked(idx) * *BRACKET_SIZES.get_unchecked(idx));
     }
 
     pub const fn fixed_header_size() -> usize {
@@ -541,6 +585,17 @@ impl Run {
     pub fn is_thread_local_free_list_empty(&self) -> bool {
         self.thread_local_free_list.size() == 0
     }
+
+    #[inline]
+    pub unsafe fn slot_from_ptr(&self, ptr: *const u8) -> *mut Slot {
+        let idx = self.size_bracket_idx as usize;
+        let bracket_size = *BRACKET_SIZES.get_unchecked(idx);
+        let offset_from_slot_base = ptr as usize - self.first_slot() as usize;
+        let slot_idx = offset_from_slot_base / bracket_size;
+
+        self.first_slot().add(slot_idx * bracket_size)
+    }
+
     #[inline]
     pub unsafe fn to_slot(&self, ptr: *const u8) -> *mut Slot {
         let idx = self.size_bracket_idx as usize;
@@ -598,9 +653,9 @@ impl Drop for Rosalloc {
     fn drop(&mut self) {
         unsafe {
             for i in 0..NUM_OF_SIZE_BRACKETS {
-                Box::from_raw(self.full_runs[i]);
-                Box::from_raw(self.non_full_runs[i]);
-                Box::from_raw(self.size_bracket_locks[i]);
+                let _ = Box::from_raw(self.full_runs[i]);
+                let _ = Box::from_raw(self.non_full_runs[i]);
+                let _ = Box::from_raw(self.size_bracket_locks[i]);
             }
         }
     }
@@ -634,6 +689,55 @@ impl Rosalloc {
             self.lock.unlock();
         }
         f
+    }
+
+    pub fn block_start(&self, ptr: *const u8) -> *mut u8 {
+        unsafe {
+            let mut pm_idx = self.round_down_to_page_map_index(ptr);
+
+            self.lock.lock();
+
+            match self.page_map.add(pm_idx).cast::<PageMapKind>().read() {
+                PageMapKind::Empty | PageMapKind::Released => {
+                    self.lock.unlock();
+                    return null_mut();
+                }
+
+                PageMapKind::LargeObject => {
+                    self.lock.unlock();
+                    return self.base.add(pm_idx * PAGE_SIZE);
+                }
+
+                PageMapKind::LargeObjectPart => {
+                    while self.page_map.add(pm_idx).cast::<PageMapKind>().read()
+                        != PageMapKind::LargeObject
+                    {
+                        pm_idx -= 1;
+                    }
+                    self.lock.unlock();
+                    return self.base.add(pm_idx * PAGE_SIZE);
+                }
+
+                PageMapKind::Run => {
+                    let run = self.base.add(pm_idx * PAGE_SIZE).cast::<Run>();
+                    let slot = (*run).slot_from_ptr(ptr);
+                    self.lock.unlock();
+                    return slot as _;
+                }
+
+                PageMapKind::RunPart => {
+                    while self.page_map.add(pm_idx).cast::<PageMapKind>().read()
+                        != PageMapKind::Run
+                    {
+                        pm_idx -= 1;
+                    }
+                    let run = self.base.add(pm_idx * PAGE_SIZE).cast::<Run>();
+                    let slot = (*run).slot_from_ptr(ptr);
+                    self.lock.unlock();
+                    return slot as _;
+                }
+            }
+        }
     }
 
     pub fn usable_size(&self, ptr: *mut u8) -> usize {
@@ -738,8 +842,10 @@ impl Rosalloc {
             morecore_data: null_mut(),
         };
 
+        
+
         if INITIALIZED
-            .compare_exchange_weak(
+            .compare_exchange(
                 false,
                 true,
                 std::sync::atomic::Ordering::SeqCst,
@@ -751,6 +857,7 @@ impl Rosalloc {
                 initialize();
             }
         }
+
         unsafe {
             for i in 0..NUM_OF_SIZE_BRACKETS {
                 this.size_bracket_locks[i] = Box::into_raw(Box::new(Lock::INIT));
@@ -890,6 +997,14 @@ impl Rosalloc {
             if req_byte_size <= fpr_byte_size {
                 self.free_page_runs.remove(&fpr);
 
+                #[cfg(feature="trace")]
+                {
+                    log::info!(
+                        "RosAlloc::alloc_pages() : Erased run {:p} from free_page_runs",
+                        fpr  
+                    );
+                }
+
                 if req_byte_size < fpr_byte_size {
                     let remainder = fpr.cast::<u8>().add(req_byte_size).cast::<FreePageRun>();
                     if cfg!(debug_assertions) {
@@ -897,7 +1012,13 @@ impl Rosalloc {
                     }
                     (*remainder).set_byte_size(self, fpr_byte_size - req_byte_size);
                     self.free_page_runs.insert(remainder);
-
+                    #[cfg(feature="trace")]
+                    {
+                        log::info!(
+                            "RosAlloc::alloc_pages() : Inserted run {:p} into free_page_runs",
+                            remainder
+                        );
+                    }
                     (*fpr).set_byte_size(self, req_byte_size);
                 }
                 res = fpr;
@@ -1003,7 +1124,8 @@ impl Rosalloc {
             }
 
             if cfg!(debug_assertions) {
-                memx::memset(std::slice::from_raw_parts_mut(res.cast(), PAGE_SIZE), 0);
+                core::ptr::write_bytes(res.cast::<u8>(), 0, PAGE_SIZE);
+                //memx::memset(std::slice::from_raw_parts_mut(res.cast(), PAGE_SIZE), 0);
             }
 
             return res.cast();
@@ -1034,7 +1156,8 @@ impl Rosalloc {
 
         let byte_size = num_pages * PAGE_SIZE;
         if !already_zero && self.page_release_mode != PageReleaseMode::All {
-            memx::memset(std::slice::from_raw_parts_mut(ptr, byte_size), 0);
+            core::ptr::write_bytes(ptr, 0, byte_size);
+            //memx::memset(std::slice::from_raw_parts_mut(ptr, byte_size), 0);
         }
 
         let mut fpr = ptr.cast::<FreePageRun>();
@@ -1067,9 +1190,9 @@ impl Rosalloc {
                 }
                 i += 1;
             }
-            let mut i = self.free_page_runs.len() - 1;
+            let mut i = self.free_page_runs.len() as isize - 1;
             while i > 0 {
-                let item = &self.free_page_runs[i];
+                let item = &self.free_page_runs[i as usize];
                 let it = *item;
                 if it > fpr {
                     i -= 1;
@@ -1126,6 +1249,7 @@ impl Rosalloc {
 
             match self.page_map.add(pm_idx).cast::<PageMapKind>().read() {
                 PageMapKind::LargeObject => {
+                    
                     let bytes = self.free_pages(ptr, false);
                     self.lock.unlock();
                     return bytes;
@@ -1236,6 +1360,13 @@ impl Rosalloc {
         }
     }
 
+    pub fn collect(&mut self, tls_runs: &mut [*mut Run; NUM_THREAD_LOCAL_SIZE_BRACKETS]) {
+        unsafe {
+            self.revoke_thread_unsafe_current_runs();
+            self.revoke_thread_local_runs(tls_runs);
+        } 
+    }
+
     /// Revoke the current runs which share the same idx as thread local runs.
     pub unsafe fn revoke_thread_unsafe_current_runs(&mut self) {
         for idx in 0..NUM_THREAD_LOCAL_SIZE_BRACKETS {
@@ -1270,6 +1401,17 @@ impl Rosalloc {
         free_bytes
     }
 
+    pub unsafe fn revoke_all_thread_local_runs<'a>(&mut self, tls_runs: impl Iterator<Item = &'a mut [*mut Run; NUM_THREAD_LOCAL_SIZE_BRACKETS]>) -> usize {
+        let mut free_bytes = 0;
+        for tls_runs in tls_runs {
+            free_bytes += self.revoke_thread_local_runs(tls_runs);
+        }
+
+        self.revoke_thread_unsafe_current_runs();
+
+        free_bytes
+    }
+
     #[inline]
     unsafe fn alloc_from_run(
         &mut self,
@@ -1292,6 +1434,9 @@ impl Rosalloc {
                 if (*thread_local_run)
                     .merge_thread_local_free_list_to_free_list(&mut is_all_free_after_merge)
                 {
+                    debug_assert_ne!(thread_local_run, dedicated_full_run());
+                    debug_assert!(!(*thread_local_run).is_full());
+                    debug_assert_eq!(is_all_free_after_merge, (*thread_local_run).is_all_free());
                 } else {
                     if thread_local_run != DEDICATED_FULL_RUN {
                         (*thread_local_run).is_thread_local = 0;
