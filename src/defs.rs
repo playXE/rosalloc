@@ -30,7 +30,7 @@ pub const GB: usize = 1024 * MB;
 
 pub const DEFAULT_PAGE_RELEASE_THRESHOLD: usize = 4 * MB;
 pub const NUM_THREAD_LOCAL_SIZE_BRACKETS: usize = 16;
-pub const MAX_THREAD_LOCAL_BRACKET_SIZE: usize = 128;
+pub const MAX_THREAD_LOCAL_BRACKET_SIZE: usize = 256;
 pub const NUM_REGULAR_SIZE_BRACKETS: usize = 40;
 pub const MAX_REGULAR_BRACKET_SIZE: usize = 512;
 pub const THREAD_LOCAL_BRACKET_QUANTUM_SIZE: usize = 16;

@@ -7,8 +7,8 @@ use std::{
 
 use rosalloc::{
     allocator::RosallocAllocator,
-    defs::{NUM_THREAD_LOCAL_SIZE_BRACKETS, MB},
-    BRACKET_SIZES, NUM_OF_PAGES, NUM_OF_SLOTS,
+    defs::{ MB},
+    BRACKET_SIZES, NUM_OF_PAGES, NUM_OF_SLOTS, HEADER_SIZES, Rosalloc,
 };
 
 pub struct UniquePtr<T> {
@@ -61,11 +61,13 @@ impl<T> std::fmt::Pointer for UniquePtr<T> {
 
 fn main() {
     println!(
-        "{:?}\n{:?}\n{:?}",
-        &BRACKET_SIZES[0..NUM_THREAD_LOCAL_SIZE_BRACKETS],
-        &NUM_OF_PAGES[0..NUM_THREAD_LOCAL_SIZE_BRACKETS],
-        &NUM_OF_SLOTS[0..NUM_THREAD_LOCAL_SIZE_BRACKETS]
+        "{:?}\n{:?}\n{:?}\n{:?}",
+        BRACKET_SIZES,
+        HEADER_SIZES,
+        NUM_OF_PAGES,
+        NUM_OF_SLOTS
     );
+    println!("{}",  BRACKET_SIZES[Rosalloc::size_to_index(970)]);
     let rosalloc = RosallocAllocator::new(2 * MB);
     
     { 

@@ -1718,10 +1718,12 @@ impl Rosalloc {
             std::slice::from_raw_parts_mut(start, end.offset_from(start) as _),
             0,
         );*/
+        core::ptr::write_bytes(start, 0, end as usize - start as usize);
         let mut pm_idx = self.to_page_map_index(start);
         let mut reclaimed_bytes = 0;
         let max_idx = pm_idx + (end as usize - start as usize) / PAGE_SIZE;
         while pm_idx < max_idx {
+            debug_assert!(self.is_free_page(pm_idx));
             if self.page_map.add(pm_idx).read() == PageMapKind::Empty as u8 {
                 // Mark the page as released and update how many bytes we released.
                 reclaimed_bytes += PAGE_SIZE;
@@ -1895,4 +1897,14 @@ type BuildNoopHasher = BuildHasherDefault<PtrHasher>;
 #[inline]
 pub fn dedicated_full_run() -> *mut Run {
     unsafe { DEDICATED_FULL_RUN }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum VisitPointerResult {
+    Free,
+    Keep,
+}
+
+pub trait WalkPages {
+    fn visit_pointer(&mut self, ptr: *mut u8, size: usize, page: *mut u8, page_kind: PageMapKind) -> VisitPointerResult;
 }
